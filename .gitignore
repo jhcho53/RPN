@@ -1,0 +1,97 @@
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_convert
+
+# ----------------------------
+# PyTorch / Checkpoints
+# ----------------------------
+*.pth
+*.pt
+*.ckpt
+*.tar
+checkpoint/
+checkpoints/
+runs/
+
+# ----------------------------
+# Logs & Outputs
+# ----------------------------
+*.log
+*.out
+*.err
+logs/
+wandb/
+tensorboard/
+events.out.tfevents.*
+
+# ----------------------------
+# Datasets & Generated Files
+# ----------------------------
+*.zip
+*.tar.gz
+*.h5
+*.mat
+*.npz
+*.npy
+*.csv
+*.json
+*.yaml
+*.yml
+*.pkl
+*.onnx
+data/
+dataset/
+outputs/
+results/
+runs_eval/
+runs_oneshot/
+# ----------------------------
+# ROS2 / Build
+# ----------------------------
+build/
+install/
+log/
+.colcon_ignore
+*.bag
+
+# ----------------------------
+# System / Editor
+# ----------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# ----------------------------
+# Custom Ignore (추가 가능)
+# ----------------------------
+# ex) 학습 스크립트 실행 후 생성되는 임시 파일
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi

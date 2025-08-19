@@ -10,7 +10,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "gt":       "/home/vip/Desktop/DC/DenseLiDAR/datasets/data_depth_annotated/train/2011_09_26_drive_0001_sync/proj_depth/groundtruth/image_02/0000000005.png"
     },
     "train": {
-        "epochs": 200,
+        "epochs": 300,
         "lr": 1e-3,
         "save_dir": "runs_oneshot",
         "tag": "mcprop_1shot"
@@ -18,13 +18,13 @@ DEFAULT_CFG: Dict[str, Any] = {
     "model": {
         "dmax": 80.0,
         "steps": 6,
-        "use_residual": False,
-        "use_sparse": True,
+        "use_residual": True,
+        "use_sparse": False,
 
         # --- anchor(Dirichlet) ---
         "anchor_alpha": 0.7,         # 초기값 (learnable이 False면 고정)
-        "anchor_learnable": False,   # True면 학습
-        "anchor_mode": "scalar",     # "scalar" or "map"
+        "anchor_learnable": True,   # True면 학습
+        "anchor_mode": "map",     # "scalar" or "map"
 
         # curvature / geometry
         "kappa_min": 1e-3,
