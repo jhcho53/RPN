@@ -40,5 +40,42 @@ DEFAULT_CFG: Dict[str, Any] = {
     "experiments": [
         {"geometry": "hyperbolic", "tag": "mcprop_1shot_hyp"},
         {"geometry": "elliptic",   "tag": "mcprop_1shot_ellip"}
-    ]
+    ],
+    
+    "kshot": {
+        # (A) 경로 기반 지정: 각 modality의 루트 디렉터리
+        #   - 디렉터리 구조가 동일하면 relpath 매칭(권장)
+        #   - 구조가 다르면 파일명(stem) 매칭 사용
+        "train_dirs": {
+            "rgb_dir":    "",   # 예: ".../kitti_raw/train/....../image_02"
+            "sparse_dir": "",   # 예: ".../data_depth_velodyne/train/....../velodyne_raw/image_02"
+            "pseudo_dir": "",   # 예: ".../pseudo_depth_map/train/....../velodyne_raw/image_02"
+            "estim_dir":  "",   # 예: ".../kitti_raw_da/train/....../image_02"
+            "gt_dir":     "",   # (선택) 없으면 비지도
+            "pattern":    "*.png",
+            "match_mode": "relpath"   # "relpath" | "stem"
+        },
+        "val_dirs": {           # 비우면 train pool에서 홀드아웃
+            "rgb_dir":    "",
+            "sparse_dir": "",
+            "pseudo_dir": "",
+            "estim_dir":  "",
+            "gt_dir":     "",
+            "pattern":    "*.png",
+            "match_mode": "relpath"
+        },
+
+        # (B) 샘플 수/추출
+        "K_train": 10,          # 10-shot: 학습 10장
+        "K_val":   5,           # 검증 5장 (디렉터리 없으면 train pool에서 홀드아웃)
+        "seed":    1,
+        "epochs":  60,
+        "lr":      1e-3,
+        "batch_size": 4,
+        "num_workers": 4,
+        "shuffle": True,
+        "save_dir": "runs_kshot",
+        "tag": "mcprop_kshot",
+        "preview_every": 5
+    }
 }

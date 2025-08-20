@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 사용 예:
+#  1) 1-shot/일반 KITTI val 평가 (root 스캔)
+#     python3 eval.py --root /home/vip/Desktop/DC/DenseLiDAR/datasets \
+#                     --ckpt runs_oneshot/mcprop_1shot_ellip_best.pt \
+#                     --out  runs_eval/mcprop_ellip_val --save-viz
+#
+#  2) k-shot 설정 기반 평가 (train_kshot에 쓰던 kshot.json의 val_dirs 사용)
+#     python3 eval.py --ckpt runs_kshot/mcprop_kshot_best.pt \
+#                     --out runs_eval/mcprop_kshot_val \
+#                     --kshot-cfg config/kshot/kshot.json --save-viz
 
 import os, sys, argparse, glob, csv, json
 from dataclasses import dataclass
@@ -20,6 +30,8 @@ try:
     )
     from models.module import TinyFeat, ResidualHead, CurvatureGen, KernelGate, normalize_affinity_list
     from models.affinity import EllipticAffinity, HCLApproxAffinity
+    # k-shot 평가 지원을 위해
+    from utils.dataset import KShotDataset, build_kshot_from_paths
 except Exception as e:
     print("[ERROR] 프로젝트 모듈을 찾을 수 없습니다. PYTHONPATH 또는 모듈 배치를 확인하세요.")
     print("예: export PYTHONPATH=$PYTHONPATH:$(pwd)")
@@ -38,14 +50,16 @@ def _deep_update(dst: dict, src: dict) -> dict:
 
 def _parse_value(val: str):
     """문자열을 bool/int/float/그대로 순으로 파싱."""
-    if val.lower() in ("true","false"):
+    if isinstance(val, str) and val.lower() in ("true","false"):
         return val.lower() == "true"
-    try:
-        if "." in val:
-            return float(val)
-        return int(val)
-    except ValueError:
-        return val
+    if isinstance(val, str):
+        try:
+            if "." in val:
+                return float(val)
+            return int(val)
+        except ValueError:
+            return val
+    return val
 
 def _apply_overrides(cfg: dict, kv_list: List[str]) -> dict:
     """
@@ -85,7 +99,7 @@ class MCPropCfg:
     kappa_max: float = 1.0
     geometry: str = "hyperbolic"      # "hyperbolic" | "elliptic"
     # (선택) anchor 관련(learnable 저장 호환)
-    anchor_mode: str = "scalar"
+    anchor_mode: str = "scalar"       # "scalar"|"map"
     anchor_learnable: bool = False
 
 class MCPropNet(nn.Module):
@@ -109,30 +123,43 @@ class MCPropNet(nn.Module):
             self.aff_head = HCLApproxAffinity(64, cfg.kernels)
 
         # (선택) anchor learnable 호환 파라미터
-        self.anchor_head = None     # map 모드 head
-        self.alpha_raw   = None     # scalar learnable
-        self.alpha_const = None     # scalar fixed(ckpt에 저장될 수 있음)
+        self.anchor_head: Optional[nn.Conv2d] = None  # map 모드 head
+        self.alpha_raw: Optional[nn.Parameter] = None # scalar learnable
+        self.register_buffer("alpha_const", None, persistent=False)  # scalar fixed가 필요할 때 쓸 수 있음
 
-    def set_anchor_modules_from_ckpt(self, sd: Dict[str, torch.Tensor]):
-        """ckpt에 anchor 관련 모듈 파라미터가 있으면 등록(호환용)."""
-        if any("anchor_head" in k for k in sd.keys()) and self.anchor_head is None:
+    def set_anchor_modules_from_ckpt(self, sd: Dict[str, torch.Tensor], device: Optional[torch.device] = None):
+        """
+        ckpt에 anchor 관련 키가 있으면 해당 모듈을 모델에 추가.
+        이후 load_state_dict로 가중치가 로드되고, 마지막에 model.to(device)로 한 번에 이동.
+        """
+        # 일단 CPU 기준으로 만들고, 나중에 model.to(device)에서 같이 이동시키는 것이 가장 안전
+        # (device 인자가 주어지면 즉시 .to(device)도 수행)
+        need_head = any("anchor_head" in k for k in sd.keys())
+        need_alpha = any("alpha_raw" in k for k in sd.keys())
+
+        if need_head and (self.anchor_head is None):
             self.anchor_head = nn.Conv2d(64, 1, kernel_size=3, padding=1)
             self.add_module("anchor_head", self.anchor_head)
-        if any("alpha_raw" in k for k in sd.keys()) and (self.alpha_raw is None):
-            self.alpha_raw = nn.Parameter(torch.tensor(0.0))
+
+        if need_alpha and (self.alpha_raw is None):
+            self.alpha_raw = nn.Parameter(torch.zeros(1))
             self.register_parameter("alpha_raw", self.alpha_raw)
+
+        # 선택적으로 즉시 디바이스로 옮기고 싶으면
+        if device is not None:
+            self.to(device)
 
     def _anchor_blend(self, Dt, D0, DL, ML, feat):
         """LiDAR soft-Dirichlet 블렌딩."""
         if not self.cfg.use_sparse:
             return Dt
-        if self.anchor_head is not None:       # map 모드
+        if self.anchor_head is not None:       # map 모드 (학습된 헤드)
             alpha_eff = torch.sigmoid(self.anchor_head(feat)) * (ML.detach())
         elif self.alpha_raw is not None:       # scalar learnable
             alpha_eff = torch.sigmoid(self.alpha_raw) * (ML.detach())
-        elif self.alpha_const is not None:     # scalar fixed
+        elif self.alpha_const is not None:     # scalar fixed (버퍼)
             alpha_eff = self.alpha_const * (ML.detach())
-        else:                                  # cfg anchor_alpha (고정)
+        else:                                  # cfg anchor_alpha (수치 → 텐서)
             alpha_eff = Dt.new_tensor(self.cfg.anchor_alpha) * (ML.detach())
         return (1.0 - alpha_eff) * Dt + alpha_eff * DL
 
@@ -181,8 +208,15 @@ def load_json(path: str) -> dict:
 def load_model_from_ckpt_with_cfg(ckpt_path: str,
                                   cfg_override: Optional[dict],
                                   set_list: Optional[List[str]],
-                                  device: torch.device) -> MCPropNet:
-    ckpt = torch.load(ckpt_path, map_location=device)
+                                  device: torch.device) -> Tuple[MCPropNet, dict]:
+    """
+    (중요) 디바이스 불일치를 피하기 위해:
+      1) ckpt는 CPU로 로드(map_location='cpu')
+      2) 모델은 CPU에서 생성, anchor 모듈 필요 시 추가
+      3) state_dict 로드 (CPU 파라미터에 복사됨)
+      4) 마지막에 model.to(device)
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     if "cfg" not in ckpt:
         raise RuntimeError("Checkpoint에 cfg가 없습니다. 학습 시 torch.save({'state_dict', 'cfg'}) 형태로 저장했는지 확인하세요.")
     base_cfg = {"model": dict(ckpt["cfg"])}  # 모델 cfg는 'model' 섹션으로 감싸 병합
@@ -210,10 +244,14 @@ def load_model_from_ckpt_with_cfg(ckpt_path: str,
         anchor_mode=mcfg.get("anchor_mode", "scalar"),
         anchor_learnable=mcfg.get("anchor_learnable", False),
     )
-    model = MCPropNet(mcfg_dc).to(device)
-    # anchor 모듈 호환 생성
-    model.set_anchor_modules_from_ckpt(ckpt["state_dict"])
+    # 1) CPU에서 모델 생성
+    model = MCPropNet(mcfg_dc)
+    # 2) anchor 모듈 필요시 생성 (CPU)
+    model.set_anchor_modules_from_ckpt(ckpt["state_dict"], device=None)
+    # 3) state_dict 로드
     model.load_state_dict(ckpt["state_dict"], strict=False)
+    # 4) 최종 디바이스로 이동
+    model.to(device)
     model.eval()
     return model, base_cfg
 
@@ -240,23 +278,33 @@ def path_map(root: str, sp_path: str) -> Dict[str, str]:
 
 # -------------------- 지표 --------------------
 
-def kitti_metrics_per_frame(pred_m: torch.Tensor, gt_m: torch.Tensor) -> Dict[str, float]:
+def kitti_metrics_per_frame(pred_m: torch.Tensor, gt_m: torch.Tensor,
+                            min_depth=1e-3, max_depth=80.0) -> Dict[str, float]:
     pred = pred_m.detach().cpu().numpy().astype(np.float64).squeeze()
     gt   = gt_m.detach().cpu().numpy().astype(np.float64).squeeze()
+
     mask = (gt > 0.0)
     n = int(mask.sum())
     if n == 0:
-        return {'se':0.0,'ae':0.0,'ise':0.0,'iae':0.0,'n':0}
-    pred = np.clip(pred[mask], 1e-6, 80.0)
-    gt   = np.clip(gt[mask],   1e-6, 80.0)
-    err = pred - gt
-    inv_err = (1.0/pred) - (1.0/gt)
+        return {'se':0.0,'ae':0.0,'ise':0.0,'iae':0.0,'n':0, 'd1c':0.0}
+
+    pred = np.clip(pred[mask], min_depth, max_depth)
+    gt   = np.clip(gt[mask],   min_depth, max_depth)
+
+    err   = pred - gt
+    inv_e = (1.0/pred) - (1.0/gt)
+    ratio = np.maximum(pred/gt, gt/pred)
+
+    # ---- DELTA1 counts ----
+    d1c = float((ratio < 1.25).sum())
+
     return {
         'se':float(np.sum(err*err)),
         'ae':float(np.sum(np.abs(err))),
-        'ise':float(np.sum(inv_err*inv_err)),
-        'iae':float(np.sum(np.abs(inv_err))),
-        'n':n
+        'ise':float(np.sum(inv_e*inv_e)),
+        'iae':float(np.sum(np.abs(inv_e))),
+        'n':n,
+        'd1c':d1c
     }
 
 def finalize_metrics(acc: Dict[str,float]) -> Dict[str,float]:
@@ -265,9 +313,10 @@ def finalize_metrics(acc: Dict[str,float]) -> Dict[str,float]:
     mae   = (acc['ae']  / n) * 1000.0
     irmse = np.sqrt(acc['ise']/ n) * 1000.0
     imae  = (acc['iae']/ n) * 1000.0
-    return {'RMSE(mm)':rmse, 'MAE(mm)':mae, 'iRMSE(1/km)':irmse, 'iMAE(1/km)':imae}
+    delta1 = (acc.get('d1c',0.0) / n) if n > 0 else float('nan')
+    return {'RMSE(mm)':rmse, 'MAE(mm)':mae, 'iRMSE(1/km)':irmse, 'iMAE(1/km)':imae, 'DELTA1':delta1}
 
-# -------------------- 평가 루프 --------------------
+# -------------------- 평가 루프 (root 스캔) --------------------
 
 @torch.no_grad()
 def evaluate(root: str, ckpt: str, out_root: str, device: torch.device,
@@ -277,7 +326,7 @@ def evaluate(root: str, ckpt: str, out_root: str, device: torch.device,
     viz_root = os.path.join(out_root, "viz", "val")
     dep_root = os.path.join(out_root, "pred", "val")
 
-    # 모델+최종 cfg 로드
+    # 모델+최종 cfg 로드 (장치/anchor 모듈 일관)
     model, final_cfg = load_model_from_ckpt_with_cfg(ckpt, cfg_override, set_list, device)
     dmax = float(model.cfg.dmax)
 
@@ -301,7 +350,7 @@ def evaluate(root: str, ckpt: str, out_root: str, device: torch.device,
     writer = csv.writer(csv_file)
     writer.writerow(["rel_path", "n_valid", "RMSE(mm)", "MAE(mm)", "iRMSE(1/km)", "iMAE(1/km)"])
 
-    acc = {'se':0.0,'ae':0.0,'ise':0.0,'iae':0.0,'n':0}
+    acc = {'se':0.0,'ae':0.0,'ise':0.0,'iae':0.0,'n':0, 'd1c':0.0}
     missing = {"rgb":0, "pseudo":0, "estim":0, "gt":0}
 
     pbar = tqdm(sparse_list, desc="Eval (val)")
@@ -364,10 +413,80 @@ def evaluate(root: str, ckpt: str, out_root: str, device: torch.device,
     else:
         print("[val] No GT found — metrics not computed.")
 
+# -------------------- k-shot 설정 기반 평가 --------------------
+
+@torch.no_grad()
+def evaluate_kshot(kshot_cfg_path: str, ckpt: str, out_root: str, device: torch.device,
+                   cfg_override: Optional[dict], set_list: Optional[List[str]],
+                   save_viz: bool):
+    """
+    train_kshot에서 사용하던 kshot.json을 그대로 받아 val_dirs를 평가합니다.
+    """
+    cfg = load_json(kshot_cfg_path)
+    if "kshot" not in cfg or "val_dirs" not in cfg["kshot"]:
+        raise ValueError("kshot 설정 파일에 'kshot.val_dirs' 섹션이 없습니다.")
+
+    # 모델 로드
+    model, _ = load_model_from_ckpt_with_cfg(ckpt, cfg_override, set_list, device)
+    dmax = float(model.cfg.dmax)
+
+    os.makedirs(out_root, exist_ok=True)
+    viz_root = os.path.join(out_root, "viz")
+    dep_root = os.path.join(out_root, "pred")
+    os.makedirs(viz_root, exist_ok=True); os.makedirs(dep_root, exist_ok=True)
+
+    # val split 구성
+    splits = build_kshot_from_paths(cfg)  # {'train': [...], 'val': [...]}
+    val_ds = KShotDataset(splits["val"])
+    loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+
+    # CSV
+    csv_path = os.path.join(out_root, "metrics_val.csv")
+    with open(csv_path, 'w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["index", "n_valid", "RMSE(mm)", "MAE(mm)", "iRMSE(1/km)", "iMAE(1/km)"])
+
+        acc = {'se':0.0,'ae':0.0,'ise':0.0,'iae':0.0,'n':0, 'd1c':0.0}
+        for idx, (I, DL, ML, P, E, GT) in enumerate(tqdm(loader, desc="Eval (k-shot val)")):
+            I, DL, ML, P, E = I.to(device), DL.to(device), ML.to(device), P.to(device), E.to(device)
+            GT = GT.to(device) if GT is not None else None
+
+            pred, aux = model(I, DL, ML, P, E)
+
+            # 저장
+            out_path = os.path.join(dep_root, f"{idx:06d}.png")
+            cv2.imwrite(out_path, (pred.clamp(0, dmax).cpu().numpy().squeeze() * 256.0).astype(np.uint16))
+
+            if save_viz:
+                base_noext = os.path.join(viz_root, f"{idx:06d}")
+                save_jet(base_noext + "_pred_jet.png", pred, dmax=dmax)
+                save_jet(base_noext + "_d0_jet.png",   aux["D0"], dmax=dmax)
+                save_sparse_jet(base_noext + "_sparse_jet.png", DL, ML, dmax=dmax)
+
+            # 지표
+            if GT is not None and GT.max() > 0:
+                m = kitti_metrics_per_frame(pred, GT)
+                for k in acc: acc[k] += m[k]
+                fm = finalize_metrics(m)
+                writer.writerow([idx, m['n'],
+                                f"{fm['RMSE(mm)']:.3f}", f"{fm['MAE(mm)']:.3f}",
+                                f"{fm['iRMSE(1/km)']:.3f}", f"{fm['iMAE(1/km)']:.3f}",
+                                f"{fm['DELTA1']:.4f}"])
+                                
+
+    # 요약 출력
+    if acc['n'] > 0:
+        tot = finalize_metrics(acc)
+        print("[k-shot val] KITTI metrics (dataset summary)")
+        for k,v in tot.items():
+            print(f"  {k:>12}: {v:10.3f}")
+    else:
+        print("[k-shot val] No GT found — metrics not computed.")
+
 # -------------------- 엔트리 --------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser("Evaluate 1-shot MCPropNet on KITTI val (cfg-aware)")
+    ap = argparse.ArgumentParser("Evaluate MCPropNet on KITTI val (cfg-aware)")
     ap.add_argument("--root", default="", help="Datasets root (없으면 --cfg의 paths.root 사용)")
     ap.add_argument("--ckpt", required=True, help="Path to checkpoint (.pt)")
     ap.add_argument("--out",  required=True, help="Output root for predictions & viz")
@@ -377,6 +496,9 @@ def parse_args():
     ap.add_argument("--save-viz", action="store_true", help="Save jet visualizations")
     ap.add_argument("--per-image", action="store_true", help="Print per-frame metrics")
     ap.add_argument("--max-frames", type=int, default=-1, help="Limit frames for quick test")
+
+    # k-shot 평가 전용 옵션 (train_kshot에서 쓰던 JSON 그대로 사용)
+    ap.add_argument("--kshot-cfg", default="", help="If set, evaluate val split described in this k-shot JSON config (ignores --root).")
     return ap.parse_args()
 
 def main():
@@ -388,9 +510,16 @@ def main():
         cfg_override = load_json(args.cfg)
         print(f"[INFO] loaded cfg file: {args.cfg}")
 
-    evaluate(root=args.root, ckpt=args.ckpt, out_root=args.out, device=device,
-             cfg_override=cfg_override, set_list=args.set,
-             save_viz=args.save_viz, per_image=args.per_image, max_frames=args.max_frames)
+    if args.kshot_cfg:
+        print(f"[INFO] k-shot config: {args.kshot_cfg}")
+        evaluate_kshot(kshot_cfg_path=args.kshot_cfg,
+                       ckpt=args.ckpt, out_root=args.out, device=device,
+                       cfg_override=cfg_override, set_list=args.set,
+                       save_viz=args.save_viz)
+    else:
+        evaluate(root=args.root, ckpt=args.ckpt, out_root=args.out, device=device,
+                 cfg_override=cfg_override, set_list=args.set,
+                 save_viz=args.save_viz, per_image=args.per_image, max_frames=args.max_frames)
 
 if __name__ == "__main__":
     main()
