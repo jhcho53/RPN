@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from config.loader import load_config
 from config.schema import MCPropCfg, LossW  # TrainCfg는 1-shot용이므로 여기선 쓰지 않음
-from utils.dataset import KShotDataset, build_kshot_from_paths
+from utils.dataset import KShotDataset, build_kshot_from_paths, build_splits_from_cfg
 from utils.io_utils import save_jet, save_sparse_jet, unfold_neighbors
 from utils.loss import l1l2_composite, scale_invariant_log_loss, lidar_consistency, rmse_mm
 
@@ -260,7 +260,7 @@ def train_kshot(cfg: Dict[str,Any], use_ddp: bool=False, use_dp: bool=False, loc
     set_seed(int(ks.get("seed", 1)))
 
     # ---- 샘플 빌드(경로 기반) ----
-    splits = build_kshot_from_paths(cfg)
+    splits = build_splits_from_cfg(cfg)
     train_ds = KShotDataset(splits["train"])
     val_ds   = KShotDataset(splits["val"])
 

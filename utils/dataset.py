@@ -1,5 +1,6 @@
 # utils/dataset.py
 import os, glob, random
+from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import torch
 from torch.utils.data import Dataset
@@ -7,6 +8,55 @@ from torch.utils.data import Dataset
 from .io_utils import (
     load_rgb, load_depth16_mm_as_m, load_pseudo_auto, load_estimation_8bit_norm
 )
+
+def _numeric_sort_key(name: str) -> Tuple[int, str]:
+    """파일 스템이 숫자면 숫자 우선 정렬, 아니면 문자열로."""
+    stem = Path(name).stem
+    if stem.isdigit():
+        return (0, int(stem))
+    return (1, stem)
+
+def _list_with_key(root_dir: str, pattern: str, key_mode: str) -> Dict[str,str]:
+    """
+    root_dir 아래에서 pattern 매칭 파일을 모두 모아 key -> fullpath 딕셔너리 생성.
+    - key_mode == "relpath": key는 root_dir 기준 상대경로
+    - key_mode == "stem":    key는 파일명(확장자 제외)
+    """
+    root = Path(root_dir)
+    files = sorted(root.rglob(pattern))
+    out = {}
+    for p in files:
+        if key_mode == "relpath":
+            k = str(p.relative_to(root).as_posix())
+        else:
+            k = p.stem
+        out[k] = str(p)
+    return out
+
+def _intersect_keys(dicts: List[Dict[str,str]]) -> List[str]:
+    """여러 modality dict의 키 교집합을 정렬해서 반환."""
+    if not dicts: return []
+    keys = set(dicts[0].keys())
+    for d in dicts[1:]:
+        keys &= set(d.keys())
+    # 숫자 우선 정렬
+    keys_sorted = sorted(list(keys), key=_numeric_sort_key)
+    return keys_sorted
+
+def _build_records(keys: List[str], maps: Dict[str, Dict[str,str]], require: List[str], optional: List[str]) -> List[Dict[str,str]]:
+    recs = []
+    for k in keys:
+        cur = {}
+        ok = True
+        for m in require:
+            if k not in maps[m]: ok=False; break
+            cur[m] = maps[m][k]
+        if not ok: continue
+        for m in optional:
+            if m in maps and k in maps[m]:
+                cur[m] = maps[m][k]
+        recs.append(cur)
+    return recs
 
 # ----------------- 1) CSV 기반(이전 호환: 필요시 사용) -----------------
 def _resolve_path(base_dir: str, p: str) -> str:
@@ -242,3 +292,91 @@ class KShotDataset(Dataset):
 
     def __getitem__(self, idx):
         return self._load_one(self.samples[idx])
+
+# =========================================================
+# 1-sequence 학습 (NEW)
+# =========================================================
+def build_seqshot_from_paths(cfg: Dict[str,Any]) -> Dict[str, List[Dict[str,str]]]:
+    """
+    cfg["seqshot"] 블록을 읽어 단일 시퀀스에서 train/val을 구성.
+    예시:
+      "seqshot": {
+        "dirs": {
+          "rgb_dir": ".../2011_09_26_drive_0001_sync/proj_depth/image_02",
+          "sparse_dir": ".../velodyne_raw/image_02",
+          "pseudo_dir": ".../velodyne_raw/image_02",
+          "estim_dir":  ".../image_02",
+          "gt_dir":     ".../groundtruth/image_02"
+        },
+        "pattern": "*.png",
+        "match_mode": "stem",      # 보통 같은 폴더에서 프레임 스템 기준 정렬
+        "start": 0,
+        "stride": 1,
+        "train_count": 100,
+        "val_count": 50,
+        "split_mode": "head"       # "head"|"interleave"|"random"
+      }
+    """
+    ss = cfg.get("seqshot", {})
+    if not ss:
+        raise ValueError("No 'seqshot' section in cfg.")
+
+    d = ss.get("dirs", {})
+    pattern    = ss.get("pattern", "*.png")
+    match_mode = ss.get("match_mode", "stem")  # sequence 내부는 stem이 안전
+    start      = int(ss.get("start", 0))
+    stride     = int(ss.get("stride", 1))
+    train_N    = int(ss.get("train_count", 0))
+    val_N      = int(ss.get("val_count", 0))
+    split_mode = ss.get("split_mode", "head").lower()
+
+    require = ["rgb","sparse","pseudo","estim"]
+    optional = ["gt"]
+
+    # 1) 각 modality에서 키‑경로 사전 생성
+    maps = {}
+    for m in require + optional:
+        key = f"{m}_dir"
+        if (m == "gt") and (key not in d or not d[key]):  # GT optional
+            continue
+        if key not in d:
+            raise ValueError(f"[seqshot] Missing dirs.{key}.")
+        maps[m] = _list_with_key(d[key], pattern, match_mode if match_mode in ("relpath","stem") else "stem")
+
+    # 2) 공통 키 목록
+    keys_all = _intersect_keys([maps[m] for m in require])
+
+    # 3) 시퀀스 하위샘플링(시작/스트라이드)
+    keys_all = keys_all[start::max(1,stride)]
+
+    # 4) split
+    if split_mode == "interleave":
+        # train/val 번갈아 (t, v, t, v, ...)
+        train_keys, val_keys = [], []
+        for i,k in enumerate(keys_all):
+            (train_keys if (i % 2 == 0) else val_keys).append(k)
+        if train_N > 0: train_keys = train_keys[:train_N]
+        if val_N   > 0: val_keys   = val_keys[:val_N]
+    elif split_mode == "random":
+        import random
+        rng = random.Random(int(ss.get("seed", 1)))
+        rng.shuffle(keys_all)
+        train_keys = keys_all[:train_N] if train_N>0 else keys_all
+        val_keys   = keys_all[train_N:train_N+val_N] if val_N>0 else []
+    else:  # "head": 앞 train_N, 뒤 val_N
+        train_keys = keys_all[:train_N] if train_N>0 else keys_all
+        val_keys   = keys_all[len(train_keys):len(train_keys)+val_N] if val_N>0 else []
+
+    # 5) record 생성
+    train_recs = _build_records(train_keys, maps, require, optional)
+    val_recs   = _build_records(val_keys,   maps, require, optional)
+    return {"train": train_recs, "val": val_recs}
+
+# =========================================================
+# 자동 분기 헬퍼 (K-shot / Seq-shot 둘 다 지원)
+# =========================================================
+def build_splits_from_cfg(cfg: Dict[str,Any]) -> Dict[str, List[Dict[str,str]]]:
+    if "seqshot" in cfg and cfg["seqshot"]:
+        return build_seqshot_from_paths(cfg)
+    # fallback: 기존 kshot
+    return build_kshot_from_paths(cfg)
