@@ -7,6 +7,7 @@ from typing import Dict, Any, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import DataLoader
 
 import torch.distributed as dist
@@ -91,6 +92,10 @@ def _resize_like(x: torch.Tensor, ref: torch.Tensor, mode: str = "bilinear") -> 
         return F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
     else:
         return F.interpolate(x, size=(H, W), mode="nearest")
+
+def _seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**31
+    np.random.seed(worker_seed); random.seed(worker_seed)
 
 # -------------------- Model --------------------
 class MCPropNet(nn.Module):
@@ -208,7 +213,7 @@ def evaluate(model, loader, device, loss_w: LossW = None, distributed: bool=Fals
             GT = F.interpolate(GT, size=pred.shape[-2:], mode="nearest")
 
         L_l1l2  = l1l2_composite(pred, GT)
-        L_si    = scale_invariant_log_loss(E + 1e-3, GT)
+        L_si    = scale_invariant_log_loss(pred + 1e-3, GT)
         L_lidar = lidar_consistency(pred, DL, ML) if model.cfg.use_sparse else pred.new_tensor(0.0)
         L       = L_l1l2 + 0.1*L_si + 0.3*L_lidar
 
@@ -276,6 +281,9 @@ def train_kshot(cfg: Dict[str,Any], use_ddp: bool=False, use_dp: bool=False, loc
     viz_every = int(ks.get("viz_every", 10))
     viz_dir   = ks.get("viz_dir", "viz")
     viz_max   = int(ks.get("viz_max_per_split", 4))
+    gen = torch.Generator()
+    gen.manual_seed(int(ks.get("seed", 1)))
+    pw = (nw > 0)
 
     # ---- Sampler (DDP) ----
     if use_ddp and get_world_size() > 1:
@@ -287,10 +295,14 @@ def train_kshot(cfg: Dict[str,Any], use_ddp: bool=False, use_dp: bool=False, loc
         val_sampler   = None
         shuffle_flag  = shuf
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=shuffle_flag,
-                              num_workers=nw, pin_memory=True, sampler=train_sampler)
-    val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False,
-                              num_workers=nw, pin_memory=True, sampler=val_sampler)
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, shuffle=shuf, num_workers=nw, pin_memory=True,
+        worker_init_fn=_seed_worker, generator=gen, persistent_workers=pw
+    )
+    val_loader   = DataLoader(
+        val_ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True,
+        worker_init_fn=_seed_worker, generator=gen, persistent_workers=pw
+    )
 
     # ---- 모델/옵티마 ----
     mcfg = cfg["model"]
@@ -358,9 +370,11 @@ def train_kshot(cfg: Dict[str,Any], use_ddp: bool=False, use_dp: bool=False, loc
         # DDP에서 train 로그 평균은 대략적인 보고만(정확한 합산은 생략)
         avg = {k: v/max(1,n) for k,v in tot.items()}
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5, verbose=True)
         logs_val = evaluate(base_model if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)) else model,
                             val_loader, device, loss_w,
                             distributed=(use_ddp and get_world_size()>1))
+        scheduler.step(logs_val["RMSEmm"])
 
         print0(f"[{tag}] Ep {ep:03d} | "
               f"Train L={avg['L']:.4f} L1L2={avg['L1L2']:.4f} SI={avg['SI']:.4f} "
