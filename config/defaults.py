@@ -4,8 +4,8 @@ from typing import Dict, Any
 DEFAULT_CFG: Dict[str, Any] = {
     "paths": {
         "rgb":      "/home/vip/Desktop/DC/DenseLiDAR/datasets/kitti_raw/train/2011_09_26_drive_0001_sync/proj_depth/image_02/0000000005.png",
-        "sparse":   "/home/vip/Desktop/DC/DenseLiDAR/datasets/data_depth_velodyne/train/2011_09_26_drive_0001_sync/proj_depth/velodyne_raw/image_02/0000000005.png",
-        "pseudo":   "/home/vip/Desktop/DC/DenseLiDAR/datasets/pseudo_depth_map/train/2011_09_26_drive_0001_sync/proj_depth/velodyne_raw/image_02/0000000005.png",
+        "sparse":   "/home/vip/jaehyeon/RPN/data/8line/train/firstseq_one/sparse/2011_09_26_drive_0001_sync/proj_depth/velodyne_raw/image_02/0000000005.png",
+        "pseudo":   "/home/vip/jaehyeon/RPN/data/8line/train/firstseq_one/poisson/2011_09_26_drive_0001_sync/proj_depth/velodyne_raw/image_02/0000000005.png",
         "estim":    "/home/vip/Desktop/DC/DenseLiDAR/datasets/kitti_raw_da/train/2011_09_26_drive_0001_sync/proj_depth/image_02/0000000005.png",
         "gt":       "/home/vip/Desktop/DC/DenseLiDAR/datasets/data_depth_annotated/train/2011_09_26_drive_0001_sync/proj_depth/groundtruth/image_02/0000000005.png"
     },
@@ -41,7 +41,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         {"geometry": "hyperbolic", "tag": "mcprop_1shot_hyp"},
         {"geometry": "elliptic",   "tag": "mcprop_1shot_ellip"}
     ],
-    
+
     "kshot": {
         # (A) 경로 기반 지정: 각 modality의 루트 디렉터리
         #   - 디렉터리 구조가 동일하면 relpath 매칭(권장)
@@ -66,15 +66,15 @@ DEFAULT_CFG: Dict[str, Any] = {
         },
 
         # (B) 샘플 수/추출
-        "K_train": 10,          # 10-shot: 학습 10장
-        "K_val":   5,           # 검증 5장 (디렉터리 없으면 train pool에서 홀드아웃)
+        "K_train": 1,          # 10-shot: 학습 10장
+        "K_val":   1,           # 검증 5장 (디렉터리 없으면 train pool에서 홀드아웃)
         "seed":    1,
-        "epochs":  60,
+        "epochs":  100,
         "lr":      1e-3,
-        "batch_size": 4,
+        "batch_size": 1,
         "num_workers": 4,
         "shuffle": True,
-        "save_dir": "runs_kshot",
+        "save_dir": "runs_1shot_8lines",
         "tag": "mcprop_kshot",
         "preview_every": 5
     }
